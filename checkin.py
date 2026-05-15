@@ -4,7 +4,6 @@ import time
 import random
 import requests
 from pypushdeer import PushDeer
-from urllib.parse import quote
 
 CHECKIN_URL = "https://glados.cloud/api/user/checkin"
 STATUS_URL = "https://glados.cloud/api/user/status"
@@ -23,14 +22,11 @@ HEADERS_BASE = {
 PAYLOAD = {"token": "glados.cloud"}
 TIMEOUT = 10
 
-# 推送相关函数 (保持不变)
 def push_deer(sckey: str, title: str, text: str):
-    """推送消息到 PushDeer"""
     if sckey:
         PushDeer(pushkey=sckey).send_text(title, desp=text)
 
 def push_serverchan(sendkey: str, title: str, content: str):
-    """推送消息到 Server 酱 (Turbo 版)"""
     if not sendkey:
         return
     url = f"https://sctapi.ftqq.com/{sendkey}.send"
@@ -49,19 +45,25 @@ def push_serverchan(sendkey: str, title: str, content: str):
         print(f"⚠️ Server 酱推送异常: {e}")
 
 def push_all(sendkey_deer: str, sendkey_sc: str, title: str, content: str):
-    """推送到所有配置的服务"""
     if sendkey_deer:
         push_deer(sendkey_deer, title, content)
     if sendkey_sc:
         push_serverchan(sendkey_sc, title, content)
     if not sendkey_deer and not sendkey_sc:
-        print("⚠️ 未配置任何推送服务，请在 Secrets 中配置 SENDKEY 或 SERVERCHAN_KEY")
+        print("⚠️ 未配置任何推送服务")
 
 def safe_json(resp):
     try:
         return resp.json()
     except Exception:
         return {}
+
+def get_points_from_data(data):
+    """从 status 接口的 data 字典中提取积分，支持多种字段名"""
+    for key in ["points", "point", "total_points", "balance"]:
+        if key in data and data[key] is not None:
+            return data[key]
+    return None
 
 def main():
     sendkey_deer = os.getenv("SENDKEY", "")
@@ -86,7 +88,7 @@ def main():
         days = "-"
 
         try:
-            # --- 1. 执行签到操作 ---
+            # 签到请求
             r = session.post(
                 CHECKIN_URL,
                 headers=headers,
@@ -99,7 +101,7 @@ def main():
 
             if "got" in msg_lower:
                 ok += 1
-                points = j.get("points", "-")  # 签到成功时，返回结果中可能包含本次增加/总计积分，但这里先用j.get获取，不过更可靠的数据在后面状态接口中
+                # 签到接口可能返回本次获得点数，但不一定包含总计，所以还是依赖 status 接口
                 status = "✅ 成功"
             elif "repeat" in msg_lower or "already" in msg_lower:
                 repeat += 1
@@ -108,27 +110,38 @@ def main():
                 fail += 1
                 status = "❌ 失败"
 
-            # --- 2. 查询用户状态 (包含总积分) ---
+            # 状态接口（获取积分和剩余天数）
             s = session.get(STATUS_URL, headers=headers, timeout=TIMEOUT)
-            sj = safe_json(s).get("data") or {}
+            sj_raw = safe_json(s)
+            sj = sj_raw.get("data") or {}
 
-            # 更新从状态接口获取的邮箱、天数和总积分
-            email = sj.get("email", email)
+            # 提取邮箱
+            if sj.get("email"):
+                email = sj["email"]
+
+            # 剩余天数
             if sj.get("leftDays") is not None:
                 days = f"{int(float(sj['leftDays']))} 天"
-            if sj.get("points") is not None:
-                points = sj.get("points")  # 👈 这里获取总积分
 
-        except Exception:
+            # 积分（使用增强提取函数）
+            points_val = get_points_from_data(sj)
+            if points_val is not None:
+                points = points_val
+            else:
+                # 如果找不到，打印警告（仅第一次）
+                if idx == 1:
+                    print(f"⚠️ 未在状态响应中找到积分字段，响应结构: {list(sj.keys())}")
+
+        except Exception as e:
             fail += 1
             status = "❌ 异常"
+            print(f"处理账号 {idx} 时出错: {e}")
 
         lines.append(f"{idx}. {email} | {status} | 积分:{points} | 剩余:{days}")
         time.sleep(random.uniform(1, 2))
 
     title = f"GLaDOS 签到完成 ✅{ok} ❌{fail} 🔁{repeat}"
     content = "\n".join(lines)
-
     print(content)
     push_all(sendkey_deer, sendkey_sc, title, content)
 
