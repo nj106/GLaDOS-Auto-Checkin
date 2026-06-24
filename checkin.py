@@ -86,6 +86,7 @@ def main():
         email = "unknown"
         points = "-"
         days = "-"
+        error_msg = ""
 
         try:
             r = session.post(
@@ -98,6 +99,10 @@ def main():
             j = safe_json(r)
             msg = j.get("message", "")
             msg_lower = msg.lower()
+            
+            # 详细的调试信息
+            print(f"\n[DEBUG 账号{idx}] HTTP状态码: {r.status_code}")
+            print(f"[DEBUG 账号{idx}] 完整响应: {r.text[:500]}")
 
             if "got" in msg_lower:
                 ok += 1
@@ -109,6 +114,8 @@ def main():
             else:
                 fail += 1
                 status = "❌ 失败"
+                # 记录具体的错误信息
+                error_msg = f" [API响应: {msg[:100] if msg else '无消息内容'}]"
 
             # 状态接口（允许失败）
             s = session.get(STATUS_URL, headers=headers, timeout=TIMEOUT)
@@ -117,17 +124,25 @@ def main():
             if sj.get("leftDays") is not None:
                 days = f"{int(float(sj['leftDays']))} 天"
 
-        except Exception:
+        except Exception as e:
             fail += 1
             status = "❌ 异常"
+            error_msg = f" [异常: {str(e)[:100]}]"
+            print(f"[DEBUG 账号{idx}] 异常详情: {e}")
 
-        lines.append(f"{idx}. {email} | {status} | P:{points} | 剩余:{days}")
+        # 错误时显示详细信息
+        if error_msg:
+            lines.append(f"{idx}. {email} | {status}{error_msg} | P:{points} | 剩余:{days}")
+        else:
+            lines.append(f"{idx}. {email} | {status} | P:{points} | 剩余:{days}")
         time.sleep(random.uniform(1, 2))
 
     title = f"GLaDOS 签到完成 ✅{ok} ❌{fail} 🔁{repeat}"
     content = "\n".join(lines)
 
+    print("\n" + "="*50)
     print(content)
+    print("="*50 + "\n")
     
     push_all(bot_token, chat_id, title, content)
 
