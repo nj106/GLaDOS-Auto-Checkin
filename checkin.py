@@ -78,6 +78,12 @@ def mask_cookie(cookie: str) -> str:
         return "***"
     return f"{cookie[:COOKIE_MASK_LENGTH]}...{cookie[-COOKIE_MASK_LENGTH:]}"
 
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    text = f"{title}\n\n{content}"
+
+    # Telegram 单条消息上限 4096 字符，做截断避免发送失败。
+    if len(text) > 4000:
+        text = text[:3990] + "..."
 
 def validate_cookie(cookie: str) -> Tuple[bool, str]:
     """验证 Cookie 是否包含必要字段"""
