@@ -11,6 +11,7 @@ jobs:
     name: GLaDOS 签到
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    if: github.event_name != 'schedule' || github.event.schedule != '0 0 1 * *'
     concurrency:
       group: glados-checkin
       cancel-in-progress: false

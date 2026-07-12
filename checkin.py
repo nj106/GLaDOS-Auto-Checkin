@@ -49,13 +49,13 @@ MIN_DELAY = 1.0
 MAX_DELAY = 2.0
 TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_TRUNCATE_LENGTH = 3990
+CONTENT_MAX_LENGTH = 3000  # 推送汇总内容统一长度上限，避免超长导致部分渠道发送失败（#4）
 COOKIE_MASK_LENGTH = 10
 # 前后各显示 10 个字符，因此长度必须 > 2*COOKIE_MASK_LENGTH + 3 = 23 才能安全脱敏，
 # 设为 24 可避免 len∈[21,23] 时前后片段重叠导致几乎暴露完整 Cookie（M3）。
 COOKIE_MIN_LENGTH = 24
 # 重复签到判定关键词（L5：提升为模块级常量，便于维护/国际化）
-REPEAT_KEYWORDS = ("repeat", "already", "重复", "已签到", "签到过", "请勿",
-                   "return tomorrow", "logged", "tomorrow", "明天")
+REPEAT_KEYWORDS = ("repeat", "already", "重复", "已签到", "签到过", "请勿")
 
 
 # ==================== 工具函数 ====================
@@ -63,7 +63,7 @@ def safe_json(resp: requests.Response) -> Dict[str, Any]:
     """安全解析 JSON 响应（用于推送等非关键路径，失败返回空字典）。"""
     try:
         return resp.json()
-    except Exception:
+    except (ValueError, requests.exceptions.JSONDecodeError):
         return {}
 
 
@@ -154,13 +154,14 @@ def parse_earned_points(message: str) -> int:
 
 
 def validate_cookie(cookie: str) -> Tuple[bool, str]:
-    """验证 Cookie 是否包含必要字段"""
+    """验证 Cookie 是否包含必要字段（按 ; 拆分 key 精确校验，避免子串误判）"""
     if not cookie or not cookie.strip():
         return False, "Cookie 为空"
     cookie = cookie.strip()
-    if "koa:sess" not in cookie:
+    keys = {part.split("=", 1)[0].strip() for part in cookie.split(";") if part.strip()}
+    if "koa:sess" not in keys:
         return False, "Cookie 缺少必要字段: koa:sess"
-    if "koa:sess.sig" not in cookie:
+    if "koa:sess.sig" not in keys:
         return False, "Cookie 缺少必要字段: koa:sess.sig"
     return True, ""
 
@@ -176,6 +177,9 @@ def is_retryable(exc: Exception) -> bool:
     if isinstance(exc, requests.exceptions.HTTPError):
         resp = getattr(exc, "response", None)
         status = getattr(resp, "status_code", 0) if resp is not None else 0
+        # 429 Too Many Requests 为限流错误，应重试（默认指数退避即可）
+        if status == 429:
+            return True
         return 500 <= status < 600
     if isinstance(exc, requests.exceptions.RequestException):
         return True
@@ -481,14 +485,11 @@ def classify_checkin(code: Any, message: str) -> str:
         code = -2
     if code == 0:
         return "ok"
-    msg = (message or "").lower()
     if code == 1:
-        # code=1 通常表示已签到，但需校验消息内容以避免误判（H4）
-        if not msg or any(kw in msg for kw in REPEAT_KEYWORDS):
-            return "repeat"
-        return "fail"
-    # 使用精确正则匹配代替宽泛的 "got" 子串检查（H3）
-    if re.search(r"got\s+\d+\s+point", msg):
+        return "repeat"          # GLaDOS 契约：code==1 即已签到，无条件（H4 根治）
+    msg = (message or "").lower()
+    # 使用精确正则匹配代替宽泛的 "got" 子串检查（H3），兼容 point/points
+    if re.search(r"got\s+\d+\s+points?", msg):
         return "ok"
     if any(kw in msg for kw in REPEAT_KEYWORDS):
         return "repeat"
@@ -550,11 +551,14 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
         except Exception as e:  # noqa: BLE001
             logger.warning("账号 %d 状态查询失败: %s", index, e)
 
-        # 3. 查询总积分
+        # 3. 查询总积分（兼容顶层 points 与 data.points 两种返回结构，#1）
         try:
             p = api_get(session, POINTS_URL, headers)
-            if p.get("points") is not None:
-                total_points = f"{safe_int_str(p['points'])} 积分"
+            pts = p.get("points")
+            if pts is None:
+                pts = (p.get("data") or {}).get("points")
+            if pts is not None:
+                total_points = f"{safe_int_str(pts)} 积分"
         except requests.exceptions.HTTPError as e:
             resp = getattr(e, "response", None)
             status_code = getattr(resp, "status_code", "?") if resp is not None else "?"
@@ -627,6 +631,10 @@ def main() -> int:
     title = f"GLaDOS 签到完成 ✅{ok} ❌{fail} 🔄{repeat}"
     content = "\n".join(lines)
 
+    # #4：汇总内容过长时统一截断，避免部分推送渠道因超限静默失败
+    if len(content) > CONTENT_MAX_LENGTH:
+        content = content[:CONTENT_MAX_LENGTH] + "\n…(内容过长已截断)"
+
     logger.info("%s", "=" * 50)
     logger.info("%s", content)
     logger.info("%s", "=" * 50)
@@ -635,12 +643,14 @@ def main() -> int:
 
     # L4：区分"业务失败"与"通知发送失败"，必要时非零退出避免误判成功
     if ok == 0 and repeat == 0 and len(cookies) > 0:
+        # 业务全部失败：无论通知是否成功，均判运行失败
         logger.error("⚠️ 全部 %d 个账号签到失败", len(cookies))
+        if pushed_configured > 0 and pushed_success == 0:
+            logger.error("⚠️ 且已配置推送渠道但全部发送失败，无人收到通知")
         return 1
+    # 业务存在成功/已签到：即便通知全部失败也视为运行成功，避免误报红
     if pushed_configured > 0 and pushed_success == 0:
-        logger.error("⚠️ 已配置推送渠道但全部发送失败，无人收到通知")
-        return 1
-
+        logger.warning("⚠️ 已配置推送渠道但全部发送失败，无人收到通知（不影响运行结果）")
     return 0
 
 
