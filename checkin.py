@@ -54,7 +54,8 @@ COOKIE_MASK_LENGTH = 10
 # 设为 24 可避免 len∈[21,23] 时前后片段重叠导致几乎暴露完整 Cookie（M3）。
 COOKIE_MIN_LENGTH = 24
 # 重复签到判定关键词（L5：提升为模块级常量，便于维护/国际化）
-REPEAT_KEYWORDS = ("repeat", "already", "重复", "已签到", "签到过", "请勿")
+REPEAT_KEYWORDS = ("repeat", "already", "重复", "已签到", "签到过", "请勿",
+                   "return tomorrow", "logged", "tomorrow", "明天")
 
 
 # ==================== 工具函数 ====================
