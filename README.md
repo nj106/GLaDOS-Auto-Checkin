@@ -25,18 +25,8 @@
 ```
 .
 ├── checkin.py                 # 签到脚本
-├── requirements.txt           # 依赖锁定 (requests==2.32.3)
-├── tests/                     # 单元测试 (unittest)
-│   └── test_checkin.py
-├── .github/workflows/
-│   └── glados.yml             # GitHub Actions 配置
-└── .gitignore                 # 忽略构建产物 (__pycache__ 等)
-```
-
-运行测试：
-
-```bash
-python -m unittest discover -s tests -v
+└── .github/workflows/
+    └── glados.yml             # GitHub Actions 配置
 ```
 
 ---
