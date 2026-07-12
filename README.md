@@ -83,17 +83,27 @@ koa:sess=xxxxxx; koa:sess.sig=yyyyyy
 | 企业微信机器人 | `WECOM_BOT_WEBHOOK` | - |
 | 云湖机器人 | `YUNHU_TOKEN` + `YUNHU_RECV_ID` | `YUNHU_RECV_TYPE` |
 
+> 🔑 **钉钉 / 飞书加签说明**：若机器人启用了「加签」校验，则 `DINGTALK_WEBHOOK` + `DINGTALK_SECRET`（或 `FEISHU_WEBHOOK` + `FEISHU_SECRET`）**必须同时配置**。只配 webhook 不配 secret 时，脚本会发送无签名请求并给出告警，加签机器人将鉴权失败。
+
 ---
 
 ## 👥 多账号配置
 
-多个账号的 Cookie 用 `&` 连接：
+多个账号的 Cookie 用 `&` 或**换行**连接（两种分隔符均可混用）：
 
 ```
 cookie_账号1 & cookie_账号2 & cookie_账号3
 ```
 
-⚠️ 不要换行，不要用逗号
+或
+
+```
+cookie_账号1
+cookie_账号2
+cookie_账号3
+```
+
+⚠️ Cookie 值本身不得包含 `&` 或换行符，否则会被错误拆分。
 
 ---
 

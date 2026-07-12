@@ -3,6 +3,8 @@ GLaDOS 自动签到脚本
 支持多账号、多种推送渠道、重试机制、日志脱敏
 """
 import os
+import re
+import sys
 import json
 import time
 import random
@@ -35,7 +37,8 @@ HEADERS_BASE = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    "content-type": "application/json;charset=UTF-8",
+    # 注意：使用 requests 的 json= 参数时会自动设置 Content-Type: application/json，
+    # 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
 }
 PAYLOAD = {"token": "glados.cloud"}
 TIMEOUT = 12
@@ -47,16 +50,41 @@ MAX_DELAY = 2.0
 TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_TRUNCATE_LENGTH = 3990
 COOKIE_MASK_LENGTH = 10
-COOKIE_MIN_LENGTH = 20
+# 前后各显示 10 个字符，因此长度必须 > 2*COOKIE_MASK_LENGTH + 3 = 23 才能安全脱敏，
+# 设为 24 可避免 len∈[21,23] 时前后片段重叠导致几乎暴露完整 Cookie（M3）。
+COOKIE_MIN_LENGTH = 24
+# 重复签到判定关键词（L5：提升为模块级常量，便于维护/国际化）
+REPEAT_KEYWORDS = ("repeat", "already", "重复", "已签到", "签到过", "请勿")
 
 
 # ==================== 工具函数 ====================
 def safe_json(resp: requests.Response) -> Dict[str, Any]:
-    """安全解析 JSON 响应"""
+    """安全解析 JSON 响应（用于推送等非关键路径，失败返回空字典）。"""
     try:
         return resp.json()
     except Exception:
         return {}
+
+
+def require_json(resp: requests.Response) -> Dict[str, Any]:
+    """
+    严格解析 JSON 响应（用于签到/状态/积分等核心请求路径）。
+
+    - 若响应体不是合法 JSON（如网关 502 的 HTML 错误页、空响应），抛出
+      requests.exceptions.RequestException，使调用方 @retry_on_failure 能捕获并重试（M1）。
+    - 同时记录原始响应片段（debug），便于排查真实失败原因。
+    """
+    try:
+        return resp.json()
+    except ValueError:
+        snippet = (resp.text or "<空响应>")[:200]
+        logger.debug(
+            "非 JSON 响应 (status=%s, content-type=%s): %s",
+            resp.status_code,
+            resp.headers.get("Content-Type"),
+            snippet,
+        )
+        raise  # JSONDecodeError 是 requests.exceptions.RequestException 的子类，可重试
 
 
 def safe_int(val: Any, default: str = "-") -> str:
@@ -92,10 +120,24 @@ def mask_email(email: str) -> str:
 
 
 def mask_cookie(cookie: str) -> str:
-    """Cookie 脱敏（只显示前后各10个字符）"""
+    """Cookie 脱敏（只显示前后各10个字符）。长度不足 COOKIE_MIN_LENGTH 时整体脱敏。"""
     if not cookie or len(cookie) <= COOKIE_MIN_LENGTH:
         return "***"
     return f"{cookie[:COOKIE_MASK_LENGTH]}...{cookie[-COOKIE_MASK_LENGTH:]}"
+
+
+def parse_earned_points(message: str) -> int:
+    """
+    从签到成功响应文本中解析本次获得的积分数（H1）。
+
+    GLaDOS 签到接口不返回 points 字段，获得积分数写在 message 中，
+    例如 "已经签到成功，获得 1 点，请明天继续签到哦！"。
+    解析失败时优雅降级为 0。
+    """
+    if not message:
+        return 0
+    m = re.search(r"获得\s*(\d+)\s*点", message)
+    return int(m.group(1)) if m else 0
 
 
 def validate_cookie(cookie: str) -> Tuple[bool, str]:
@@ -110,9 +152,26 @@ def validate_cookie(cookie: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def is_retryable(exc: Exception) -> bool:
+    """
+    判断异常是否可重试（M2）。
+
+    - 网络层异常（超时/连接错误/JSON 解析失败等 RequestException，非 HTTPError）：可重试；
+    - HTTPError：仅 5xx 服务端错误可重试，4xx 客户端错误（如 Cookie 失效 401/403）不可重试；
+    - 其它异常：不可重试。
+    """
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", 0) if resp is not None else 0
+        return 500 <= status < 600
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True
+    return False
+
+
 def retry_on_failure(max_retries: int = MAX_RETRY, min_wait: float = RETRY_MIN_WAIT,
                      max_wait: float = RETRY_MAX_WAIT):
-    """重试装饰器（指数退避）"""
+    """重试装饰器（指数退避，仅对可重试异常重试）"""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -120,13 +179,15 @@ def retry_on_failure(max_retries: int = MAX_RETRY, min_wait: float = RETRY_MIN_W
             for attempt in range(max_retries + 1):
                 try:
                     return func(*args, **kwargs)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     last_exception = e
-                    if attempt < max_retries:
+                    if attempt < max_retries and is_retryable(e):
                         wait_time = min(min_wait * (2 ** attempt), max_wait)
                         logger.warning("第 %d 次尝试失败: %s，%.1f秒后重试...",
                                        attempt + 1, e, wait_time)
                         time.sleep(wait_time)
+                        continue
+                    break  # 不可重试（如 4xx）直接退出
             raise last_exception  # type: ignore
         return wrapper
     return decorator
@@ -142,8 +203,8 @@ def _push_request(
     headers: Optional[Dict[str, str]] = None,
     success_check: Callable[[Dict[str, Any], requests.Response], bool],
     fail_msg_keys: Tuple[str, ...] = ("message",),
-) -> None:
-    """通用推送请求函数"""
+) -> bool:
+    """通用推送请求函数，返回是否推送成功（M4：失败响应截断后记录）。"""
     try:
         if json_payload is not None:
             r = requests.post(url, json=json_payload, headers=headers, timeout=TIMEOUT)
@@ -152,22 +213,27 @@ def _push_request(
         resp = safe_json(r)
         if success_check(resp, r):
             logger.info("%s 推送成功", name)
-        else:
-            fail_msg = r.text
-            for key in fail_msg_keys:
-                if resp.get(key):
-                    fail_msg = resp[key]
-                    break
-            logger.warning("%s 推送失败: %s", name, fail_msg)
-    except Exception as e:
+            return True
+        fail_msg = r.text
+        for key in fail_msg_keys:
+            if resp.get(key):
+                fail_msg = resp[key]
+                break
+        # 截断失败响应，避免大段 HTML 或可能回显账号标识的敏感信息落入日志（M4）
+        if fail_msg and len(fail_msg) > 200:
+            fail_msg = fail_msg[:200] + "...(已截断)"
+        logger.warning("%s 推送失败: %s", name, fail_msg)
+        return False
+    except Exception as e:  # noqa: BLE001
         logger.warning("%s 推送异常: %s", name, e)
+        return False
 
 
-def push_deer(key: str, title: str, content: str) -> None:
+def push_deer(key: str, title: str, content: str) -> bool:
     """PushDeer 推送"""
     if not key:
-        return
-    _push_request(
+        return False
+    return _push_request(
         "PushDeer",
         "https://api2.pushdeer.com/message/push",
         json_payload={"pushkey": key, "text": f"{title}\n\n{content}", "type": "text"},
@@ -176,11 +242,11 @@ def push_deer(key: str, title: str, content: str) -> None:
     )
 
 
-def push_serverchan(key: str, title: str, content: str) -> None:
+def push_serverchan(key: str, title: str, content: str) -> bool:
     """Server酱推送"""
     if not key:
-        return
-    _push_request(
+        return False
+    return _push_request(
         "Server酱",
         f"https://sctapi.ftqq.com/{key}.send",
         data_payload={"title": title, "desp": content},
@@ -189,14 +255,14 @@ def push_serverchan(key: str, title: str, content: str) -> None:
     )
 
 
-def push_telegram(bot_token: str, chat_id: str, title: str, content: str) -> None:
+def push_telegram(bot_token: str, chat_id: str, title: str, content: str) -> bool:
     """Telegram Bot 推送"""
     if not bot_token or not chat_id:
-        return
+        return False
     text = f"{title}\n\n{content}"
     if len(text) > TELEGRAM_MAX_LENGTH:
         text = text[:TELEGRAM_TRUNCATE_LENGTH] + "\n..."
-    _push_request(
+    return _push_request(
         "Telegram",
         f"https://api.telegram.org/bot{bot_token}/sendMessage",
         json_payload={"chat_id": chat_id, "text": text},
@@ -205,11 +271,11 @@ def push_telegram(bot_token: str, chat_id: str, title: str, content: str) -> Non
     )
 
 
-def push_pushplus(token: str, title: str, content: str) -> None:
+def push_pushplus(token: str, title: str, content: str) -> bool:
     """PushPlus 推送"""
     if not token:
-        return
-    _push_request(
+        return False
+    return _push_request(
         "PushPlus",
         "https://www.pushplus.plus/send",
         json_payload={"token": token, "title": title, "content": content, "template": "html"},
@@ -218,10 +284,10 @@ def push_pushplus(token: str, title: str, content: str) -> None:
     )
 
 
-def push_dingtalk(webhook_url: str, title: str, content: str) -> None:
+def push_dingtalk(webhook_url: str, title: str, content: str) -> bool:
     """钉钉机器人推送（支持加签）"""
     if not webhook_url:
-        return
+        return False
     try:
         secret = os.getenv("DINGTALK_SECRET", "")
         if secret:
@@ -235,8 +301,14 @@ def push_dingtalk(webhook_url: str, title: str, content: str) -> None:
             sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
             separator = "&" if "?" in webhook_url else "?"
             webhook_url = f"{webhook_url}{separator}timestamp={timestamp}&sign={sign}"
+        else:
+            # L6：webhook 已配置但 secret 缺失，加签机器人将鉴权失败，给出明确告警
+            logger.warning(
+                "DINGTALK_WEBHOOK 已配置，但 DINGTALK_SECRET 缺失："
+                "将发送无签名请求（若机器人启用了加签校验会失败）"
+            )
 
-        _push_request(
+        return _push_request(
             "钉钉机器人",
             webhook_url,
             json_payload={
@@ -247,14 +319,15 @@ def push_dingtalk(webhook_url: str, title: str, content: str) -> None:
             success_check=lambda resp, r: r.ok and resp.get("errcode") == 0,
             fail_msg_keys=("errmsg",),
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("钉钉机器人推送异常: %s", e)
+        return False
 
 
-def push_feishu(webhook_url: str, title: str, content: str) -> None:
+def push_feishu(webhook_url: str, title: str, content: str) -> bool:
     """飞书机器人推送（支持加签）"""
     if not webhook_url:
-        return
+        return False
     try:
         data: Dict[str, Any] = {
             "msg_type": "interactive",
@@ -280,8 +353,14 @@ def push_feishu(webhook_url: str, title: str, content: str) -> None:
             sign = base64.b64encode(hmac_code).decode("utf-8")
             data["timestamp"] = timestamp
             data["sign"] = sign
+        else:
+            # L6：webhook 已配置但 secret 缺失，加签机器人将鉴权失败，给出明确告警
+            logger.warning(
+                "FEISHU_WEBHOOK 已配置，但 FEISHU_SECRET 缺失："
+                "将发送无签名请求（若机器人启用了加签校验会失败）"
+            )
 
-        _push_request(
+        return _push_request(
             "飞书机器人",
             webhook_url,
             json_payload=data,
@@ -289,15 +368,16 @@ def push_feishu(webhook_url: str, title: str, content: str) -> None:
             success_check=lambda resp, r: r.ok and resp.get("code") == 0,
             fail_msg_keys=("msg",),
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("飞书机器人推送异常: %s", e)
+        return False
 
 
-def push_wecom_bot(webhook_url: str, title: str, content: str) -> None:
+def push_wecom_bot(webhook_url: str, title: str, content: str) -> bool:
     """企业微信机器人推送"""
     if not webhook_url:
-        return
-    _push_request(
+        return False
+    return _push_request(
         "企业微信机器人",
         webhook_url,
         json_payload={
@@ -310,12 +390,12 @@ def push_wecom_bot(webhook_url: str, title: str, content: str) -> None:
     )
 
 
-def push_yunhu(token: str, recv_id: str, title: str, content: str) -> None:
+def push_yunhu(token: str, recv_id: str, title: str, content: str) -> bool:
     """云湖机器人推送"""
     if not token or not recv_id:
-        return
+        return False
     recv_type = os.getenv("YUNHU_RECV_TYPE", "group")
-    _push_request(
+    return _push_request(
         "云湖机器人",
         "https://chat-go.jwzhd.com/open-apis/v1/bot/send-message",
         json_payload={
@@ -331,64 +411,47 @@ def push_yunhu(token: str, recv_id: str, title: str, content: str) -> None:
     )
 
 
-def push_all(title: str, content: str) -> None:
-    """推送到所有已配置的通知渠道"""
-    configured = []
+# ==================== 推送渠道配置（L3：数据驱动，便于扩展/维护） ====================
+# 每个条目: (渠道名, 触发所需的 env 变量列表, 推送调用闭包)
+PUSH_CHANNELS: List[Tuple[str, List[str], Callable[[str, str], bool]]] = [
+    ("PushDeer", ["SENDKEY"],
+     lambda t, c: push_deer(os.getenv("SENDKEY", ""), t, c)),
+    ("Server酱", ["SERVERCHAN_KEY"],
+     lambda t, c: push_serverchan(os.getenv("SERVERCHAN_KEY", ""), t, c)),
+    ("Telegram", ["TG_BOT_TOKEN", "TG_CHAT_ID"],
+     lambda t, c: push_telegram(os.getenv("TG_BOT_TOKEN", ""), os.getenv("TG_CHAT_ID", ""), t, c)),
+    ("PushPlus", ["PUSHPLUS_TOKEN"],
+     lambda t, c: push_pushplus(os.getenv("PUSHPLUS_TOKEN", ""), t, c)),
+    ("钉钉机器人", ["DINGTALK_WEBHOOK"],
+     lambda t, c: push_dingtalk(os.getenv("DINGTALK_WEBHOOK", ""), t, c)),
+    ("飞书机器人", ["FEISHU_WEBHOOK"],
+     lambda t, c: push_feishu(os.getenv("FEISHU_WEBHOOK", ""), t, c)),
+    ("企业微信机器人", ["WECOM_BOT_WEBHOOK"],
+     lambda t, c: push_wecom_bot(os.getenv("WECOM_BOT_WEBHOOK", ""), t, c)),
+    ("云湖机器人", ["YUNHU_TOKEN", "YUNHU_RECV_ID"],
+     lambda t, c: push_yunhu(os.getenv("YUNHU_TOKEN", ""), os.getenv("YUNHU_RECV_ID", ""), t, c)),
+]
 
-    # PushDeer
-    pushdeer_key = os.getenv("SENDKEY", "")
-    if pushdeer_key:
-        push_deer(pushdeer_key, title, content)
-        configured.append("PushDeer")
 
-    # Server酱
-    serverchan_key = os.getenv("SERVERCHAN_KEY", "")
-    if serverchan_key:
-        push_serverchan(serverchan_key, title, content)
-        configured.append("Server酱")
+def push_all(title: str, content: str) -> Tuple[int, int]:
+    """
+    推送到所有已配置的通知渠道。
 
-    # Telegram
-    tg_bot_token = os.getenv("TG_BOT_TOKEN", "")
-    tg_chat_id = os.getenv("TG_CHAT_ID", "")
-    if tg_bot_token and tg_chat_id:
-        push_telegram(tg_bot_token, tg_chat_id, title, content)
-        configured.append("Telegram")
+    返回 (成功数, 已配置数)，供主流程区分"业务失败"与"通知发送失败"（L4）。
+    """
+    results: List[Tuple[str, bool]] = []
+    for name, env_vars, fn in PUSH_CHANNELS:
+        if all(os.getenv(v, "").strip() for v in env_vars):
+            ok_push = fn(title, content)
+            results.append((name, bool(ok_push)))
 
-    # PushPlus
-    pushplus_token = os.getenv("PUSHPLUS_TOKEN", "")
-    if pushplus_token:
-        push_pushplus(pushplus_token, title, content)
-        configured.append("PushPlus")
-
-    # 钉钉机器人
-    dingtalk_webhook = os.getenv("DINGTALK_WEBHOOK", "")
-    if dingtalk_webhook:
-        push_dingtalk(dingtalk_webhook, title, content)
-        configured.append("钉钉机器人")
-
-    # 飞书机器人
-    feishu_webhook = os.getenv("FEISHU_WEBHOOK", "")
-    if feishu_webhook:
-        push_feishu(feishu_webhook, title, content)
-        configured.append("飞书机器人")
-
-    # 企业微信机器人
-    wecom_webhook = os.getenv("WECOM_BOT_WEBHOOK", "")
-    if wecom_webhook:
-        push_wecom_bot(wecom_webhook, title, content)
-        configured.append("企业微信机器人")
-
-    # 云湖机器人
-    yunhu_token = os.getenv("YUNHU_TOKEN", "")
-    yunhu_recv_id = os.getenv("YUNHU_RECV_ID", "")
-    if yunhu_token and yunhu_recv_id:
-        push_yunhu(yunhu_token, yunhu_recv_id, title, content)
-        configured.append("云湖机器人")
-
+    configured = [n for n, _ in results]
+    success = sum(1 for _, ok_push in results if ok_push)
     if not configured:
         logger.warning("未配置任何推送服务，请在 Secrets 中设置至少一种推送渠道")
     else:
-        logger.info("已推送至: %s", ", ".join(configured))
+        logger.info("已推送至: %s（成功 %d/%d）", ", ".join(configured), success, len(configured))
+    return success, len(configured)
 
 
 # ==================== 签到逻辑 ====================
@@ -408,7 +471,7 @@ def classify_checkin(code: Any, message: str) -> str:
     msg = message.lower()
     if "got" in msg:
         return "ok"
-    if any(kw in msg for kw in ("repeat", "already", "重复", "已签到", "签到过", "请勿")):
+    if any(kw in msg for kw in REPEAT_KEYWORDS):
         return "repeat"
     return "fail"
 
@@ -418,7 +481,7 @@ def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[
     """执行签到请求（带重试）"""
     r = session.post(CHECKIN_URL, headers=headers, json=PAYLOAD, timeout=TIMEOUT)
     r.raise_for_status()
-    return safe_json(r)
+    return require_json(r)  # 非 JSON 响应抛异常进入重试（M1）
 
 
 @retry_on_failure()
@@ -426,7 +489,7 @@ def api_get(session: requests.Session, url: str, headers: Dict[str, str]) -> Dic
     """查询账号状态/积分（带重试）"""
     r = session.get(url, headers=headers, timeout=TIMEOUT)
     r.raise_for_status()
-    return safe_json(r)
+    return require_json(r)  # 非 JSON 响应抛异常进入重试（M1）
 
 
 def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[str, Any]:
@@ -447,7 +510,8 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
         j = checkin_request(session, headers)
         code = j.get("code", -2)
         message = j.get("message", "")
-        earned = j.get("points", 0) or 0
+        # H1：GLaDOS 不返回 points 字段，从 message 文本解析本次获得积分
+        earned = parse_earned_points(message)
         result = classify_checkin(code, message)
 
         if result == "ok":
@@ -464,7 +528,7 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
             email = data.get("email", email)
             if data.get("leftDays") is not None:
                 days = f"{safe_int(data['leftDays'])} 天"
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("账号 %d 状态查询失败: %s", index, e)
 
         # 3. 查询总积分
@@ -472,10 +536,10 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
             p = api_get(session, POINTS_URL, headers)
             if p.get("points") is not None:
                 total_points = f"{safe_int(p['points'])} 积分"
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("账号 %d 积分查询失败: %s", index, e)
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error("账号 %d 签到异常: %s", index, e)
         status = f"❌ 异常({type(e).__name__})"
         result = "fail"
@@ -492,11 +556,13 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
 
 # ==================== 主流程 ====================
 def main() -> None:
-    cookies = [c.strip() for c in os.getenv("COOKIES", "").split("&") if c.strip()]
+    # L2：支持 & 或换行(\n)分隔多账号 Cookie；Cookie 值不得包含 & 或换行
+    raw = os.getenv("COOKIES", "")
+    cookies = [c.strip() for c in re.split(r"[&\n]", raw) if c.strip()]
 
     if not cookies:
         push_all("GLaDOS 签到", "❌ 未检测到 COOKIES，请配置 GitHub Secrets")
-        return
+        sys.exit(1)  # L4：配置缺失视为失败，避免 CI 误标绿
 
     logger.info("检测到 %d 个账号", len(cookies))
 
@@ -542,7 +608,15 @@ def main() -> None:
     logger.info("%s", content)
     logger.info("%s", "=" * 50)
 
-    push_all(title, content)
+    pushed_success, pushed_configured = push_all(title, content)
+
+    # L4：区分"业务失败"与"通知发送失败"，必要时非零退出避免误判成功
+    if ok == 0 and repeat == 0 and len(cookies) > 0:
+        logger.error("⚠️ 全部 %d 个账号签到失败", len(cookies))
+        sys.exit(1)
+    if pushed_configured > 0 and pushed_success == 0:
+        logger.error("⚠️ 已配置推送渠道但全部发送失败，无人收到通知")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
