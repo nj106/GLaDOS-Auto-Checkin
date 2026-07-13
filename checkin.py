@@ -143,12 +143,19 @@ def parse_earned_points(message: str) -> int:
     """
     从签到成功响应文本中解析本次获得的积分数（H1）。
 
-    GLaDOS 签到接口不返回 points 字段，获得积分数写在 message 中，
-    例如 "已经签到成功，获得 1 点，请明天继续签到哦！"。
+    GLaDOS 签到接口不返回 points 字段，获得积分数写在 message 中。
+    兼容中英文两种文案（与 classify_checkin 的成功判定保持一致）：
+      - 英文： "Checkin success, got 1 points"
+      - 中文： "已经签到成功，获得 1 点，请明天继续签到哦！"
     解析失败时优雅降级为 0。
     """
     if not message:
         return 0
+    # 优先匹配英文 "got N points"（新版 GLaDOS 默认返回此文案）
+    m = re.search(r"got\s+(\d+)\s+points?", message, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    # 兼容旧版中文文案 "获得 N 点"
     m = re.search(r"获得\s*(\d+)\s*点", message)
     return int(m.group(1)) if m else 0
 
