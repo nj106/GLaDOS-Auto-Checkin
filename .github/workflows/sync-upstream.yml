@@ -1,3 +1,5 @@
+# sync upstream main (apply upstream versions for conflicting files)
+
 name: Sync upstream main (direct merge)
 
 on:
@@ -44,35 +46,18 @@ jobs:
             exit 0
           fi
 
-      - name: Merge upstream/main into main (allow unrelated histories)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Apply upstream versions for conflicting files
         run: |
-          git checkout main
-          # Ensure we have the latest origin/main
-          git fetch origin --depth=1
-          # Try to merge upstream, allowing unrelated histories
-          if git merge --allow-unrelated-histories --no-edit upstream/main; then
-            echo "Merge succeeded"
-          else
-            echo "Merge conflict or error occurred during merge. Aborting and failing the job."
-            git merge --abort || true
-            # Provide diagnostics
-            echo "*** git status ***"
-            git status --porcelain
-            echo "*** git log --oneline -n 10 (origin/main) ***"
-            git log --oneline origin/main -n 10 || true
-            echo "*** git log --oneline -n 10 (upstream/main) ***"
-            git log --oneline upstream/main -n 10 || true
-            exit 1
-          fi
+          git fetch upstream
+          # Checkout upstream versions of the conflicting files into the working tree
+          git checkout upstream/main -- .github/workflows/glados.yml README.md checkin.py
+          git commit -m "sync: accept upstream versions for conflicting files" || true
 
-      - name: Push merged changes to origin/main
+      - name: Push changes to origin/main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Push the merge commit to the repository
           git push origin HEAD:main
 
       - name: Done
-        run: echo "Upstream main merged into origin/main successfully."
+        run: echo "Applied upstream versions and pushed to origin/main."
