@@ -44,15 +44,15 @@ jobs:
             exit 0
           fi
 
-      - name: Merge upstream/main into main
+      - name: Merge upstream/main into main (allow unrelated histories)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git checkout main
           # Ensure we have the latest origin/main
           git fetch origin --depth=1
-          # Try to merge upstream
-          if git merge --no-edit upstream/main; then
+          # Try to merge upstream, allowing unrelated histories
+          if git merge --allow-unrelated-histories --no-edit upstream/main; then
             echo "Merge succeeded"
           else
             echo "Merge conflict or error occurred during merge. Aborting and failing the job."
