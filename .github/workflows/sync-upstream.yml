@@ -1,0 +1,78 @@
+name: Sync upstream main (direct merge)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 1'  # Every Monday 00:00 UTC
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync upstream main (direct merge)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/MZRidaz/GLaDOS-Auto-Checkin.git || true
+          git fetch upstream --no-tags --prune --depth=1
+
+      - name: Check for upstream changes
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          ORIGIN_SHA=$(git rev-parse origin/main)
+          echo "upstream: $UPSTREAM_SHA"
+          echo "origin:   $ORIGIN_SHA"
+          if [ "$UPSTREAM_SHA" = "$ORIGIN_SHA" ]; then
+            echo "Upstream is up-to-date. Nothing to do."
+            exit 0
+          fi
+
+      - name: Merge upstream/main into main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git checkout main
+          # Ensure we have the latest origin/main
+          git fetch origin --depth=1
+          # Try to merge upstream
+          if git merge --no-edit upstream/main; then
+            echo "Merge succeeded"
+          else
+            echo "Merge conflict or error occurred during merge. Aborting and failing the job."
+            git merge --abort || true
+            # Provide diagnostics
+            echo "*** git status ***"
+            git status --porcelain
+            echo "*** git log --oneline -n 10 (origin/main) ***"
+            git log --oneline origin/main -n 10 || true
+            echo "*** git log --oneline -n 10 (upstream/main) ***"
+            git log --oneline upstream/main -n 10 || true
+            exit 1
+          fi
+
+      - name: Push merged changes to origin/main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Push the merge commit to the repository
+          git push origin HEAD:main
+
+      - name: Done
+        run: echo "Upstream main merged into origin/main successfully."
