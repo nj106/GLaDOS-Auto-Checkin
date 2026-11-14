@@ -27,17 +27,25 @@ logger = logging.getLogger("GLaDOS")
 
 # ==================== 配置 ====================
 CHECKIN_URL = "https://glados.cloud/api/user/checkin"
+CHALLENGE_URL = "https://glados.cloud/api/user/checkin/challenge"
 STATUS_URL = "https://glados.cloud/api/user/status"
 POINTS_URL = "https://glados.cloud/api/user/points"
 EXCHANGE_URL = "https://glados.cloud/api/user/exchange"
+# 前端同款 challenge 证明：proof = SHA-256 十六进制(nonce + ".glados-observe-v1")
+# （自 GLaDOS 前端 JS 反推，2026-11-14；纯哈希计算，无需浏览器）
+PROOF_SUFFIX = "glados-observe-v1"
+CHALLENGE_MIN_WAIT = 2.5  # 前端在取 challenge 后至少等 2.5 秒才提交签到
 HEADERS_BASE = {
     "origin": "https://glados.cloud",
     "referer": "https://glados.cloud/console/checkin",
     "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
+    # 注意：UA 必须与 Cookie 的登录设备一致（Macintosh）。
+    # GLaDOS 会校验登录设备与当前设备，Windows UA + macOS 登录的 Cookie
+    # 会触发 device-mismatch（2026-10-27 实测）。不要改回 Windows。
     # 注意：使用 requests 的 json= 参数时会自动设置 Content-Type: application/json，
     # 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
 }
@@ -587,10 +595,64 @@ def classify_checkin(code: Any, message: str) -> str:
     return "fail"
 
 
+def checkin_proof(nonce: str) -> str:
+    """算 challenge 证明：SHA-256 十六进制(nonce + ".glados-observe-v1")。
+
+    与 GLaDOS 前端 checkinProof 完全一致（前端用 window.crypto.subtle.digest），
+    纯哈希计算，不需要浏览器。
+    """
+    return hashlib.sha256(f"{nonce}.{PROOF_SUFFIX}".encode("utf-8")).hexdigest()
+
+
+@retry_on_failure()
+def get_challenge(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Any]:
+    """取签到 challenge（带重试），返回 {code, nonce, ttl, turnstile}。
+
+    turnstile 为 null 表示本次不需要人机验证；为对象时表示服务端要求
+    Turnstile token——纯脚本拿不到 token（需要浏览器跑 widget），见 checkin_request。
+    """
+    r = session.get(CHALLENGE_URL, headers=headers, timeout=TIMEOUT)
+    r.raise_for_status()
+    return require_json(r)
+
+
 @retry_on_failure()
 def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Any]:
-    """执行签到请求（带重试）"""
-    r = session.post(CHECKIN_URL, headers=headers, json=PAYLOAD, timeout=TIMEOUT)
+    """执行签到请求（带重试）——新流程：先取 challenge，再带 nonce/proof 提交。
+
+    GLaDOS 自 2026-11-14 前后要求签到先过 challenge：旧的只发 {"token": ...}
+    会被服务端以「Cloudflare verification failed」拒绝。流程与前端一致：
+    GET challenge → 等够 2.5 秒 → 算 proof → POST {token, nonce, proof, tsState, turnstile?}。
+    challenge 里 turnstile 为 null 时 tsState="off"，无需浏览器即可完成；
+    turnstile 非空时纯脚本拿不到 token，如实上报 tsState="error" 并仍带 proof
+    提交一次（服务端可能直接拒绝，日志会明确写出 Turnstile 原因）。
+    """
+    payload = dict(PAYLOAD)  # {"token": "glados.cloud"}
+    challenge_at = time.monotonic()
+    challenge = get_challenge(session, headers)
+    if challenge.get("code") == 0 and challenge.get("nonce"):
+        nonce = challenge["nonce"]
+        if challenge.get("turnstile"):
+            logger.warning(
+                "本次 challenge 要求 Turnstile 人机验证，纯脚本无法获取 token，"
+                "仍将带 proof 提交（服务端可能拒绝）；如需通过请用浏览器手动签到"
+            )
+            ts_state = "error"
+        else:
+            ts_state = "off"
+        # 前端同款节流：取 challenge 后至少等 2.5 秒才提交
+        elapsed = time.monotonic() - challenge_at
+        if elapsed < CHALLENGE_MIN_WAIT:
+            time.sleep(CHALLENGE_MIN_WAIT - elapsed)
+        payload["nonce"] = nonce
+        payload["proof"] = checkin_proof(nonce)
+        payload["tsState"] = ts_state
+    else:
+        logger.warning(
+            "challenge 未返回有效 nonce（code=%s message=%s），将按旧格式提交",
+            challenge.get("code"), challenge.get("message", ""),
+        )
+    r = session.post(CHECKIN_URL, headers=headers, json=payload, timeout=TIMEOUT)
     r.raise_for_status()
     return require_json(r)  # 非 JSON 响应抛异常进入重试（M1）
 
@@ -647,6 +709,7 @@ def checkin_account(
         j = checkin_request(session, headers)
         code = j.get("code", -2)
         message = j.get("message", "")
+        reason = j.get("reason", "")
         # H1：GLaDOS 不返回 points 字段，从 message 文本解析本次获得积分
         earned = parse_earned_points(message)
         result = classify_checkin(code, message)
@@ -661,6 +724,9 @@ def checkin_account(
             if any(kw in (message or "").lower() for kw in AUTH_FAIL_KEYWORDS):
                 status = f"❌ 鉴权失败({message}) → 请重新获取 Cookie"
                 logger.warning("账号 %d 鉴权失败，Cookie 可能已过期或复制不完整: %s", index, message)
+            elif reason == "turnstile":
+                status = f"❌ 失败({message}) → 服务端要求 Turnstile 人机验证，纯脚本无法通过，请浏览器手动签到"
+                logger.warning("账号 %d 签到被 Turnstile 拦截（reason=turnstile）", index)
             else:
                 status = f"❌ 失败({message})"
 
